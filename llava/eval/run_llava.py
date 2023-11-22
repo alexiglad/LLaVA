@@ -47,6 +47,143 @@ def load_images(image_files):
         out.append(image)
     return out
 
+# def generate_output(model_path, tokenizer, model, image_processor, context_len, images_tensor, texts):
+#     # Process each text in the list
+#     processed_texts = []
+#     for text in texts:
+#         # Prepend the image token to the text
+#         processed_text = DEFAULT_IMAGE_TOKEN + "\n" + text
+#         processed_texts.append(processed_text)
+    
+#     # Tokenize the processed texts
+#     model_name = get_model_name_from_path(model_path)
+#     if "llama-2" in model_name.lower():
+#         conv_mode = "llava_llama_2"
+#     elif "v1" in model_name.lower():
+#         conv_mode = "llava_v1"
+#     elif "mpt" in model_name.lower():
+#         conv_mode = "mpt"
+#     else:
+#         conv_mode = "llava_v0"
+#     conv = conv_templates[conv_mode].copy()
+#     # conv.append_message(conv.roles[0], qs)
+#     # conv.append_message(conv.roles[1], None)
+#     # prompt = conv.get_prompt()
+
+#     input_ids = tokenizer.batch_encode_plus(
+#         processed_texts, max_length=context_len, padding=True, return_tensors="pt"
+#     ).input_ids.to(model.device)
+#     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+#     keywords = [stop_str]
+#     stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+#     # Generate output for each text-image pair
+#     outputs = []
+#     with torch.inference_mode():
+#         for i in range(len(texts)):
+
+#             output_ids = model.generate(
+#                 input_ids[i].unsqueeze(0),
+#                 images=images_tensor[i].unsqueeze(0),
+#                 do_sample=False,  # getting baseline results so no sampling
+#                 use_cache=True,
+#                 stopping_criteria=[stopping_criteria],
+#                 # Add other generation parameters as required
+#             )
+#             # Decode and process the output
+#             output_text = tokenizer.decode(
+#                 output_ids[0], skip_special_tokens=True
+#             ).strip()
+#             outputs.append(output_text)
+
+#     return outputs
+def generate_output(model_name, tokenizer, model, image_processor, context_len, images_tensor, texts):
+    # Model
+    disable_torch_init()
+
+    # tokenizer, model, image_processor, context_len = load_pretrained_model(
+    #     args.model_path, args.model_base, model_name
+    # )
+
+    qs = texts[0]
+    image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+    if IMAGE_PLACEHOLDER in qs:
+        if model.config.mm_use_im_start_end:
+            qs = re.sub(IMAGE_PLACEHOLDER, image_token_se, qs)
+        else:
+            qs = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, qs)
+    else:
+        if model.config.mm_use_im_start_end:
+            qs = image_token_se + "\n" + qs
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + "\n" + qs
+
+    if "llama-2" in model_name.lower():
+        conv_mode = "llava_llama_2"
+    elif "v1" in model_name.lower():
+        conv_mode = "llava_v1"
+    elif "mpt" in model_name.lower():
+        conv_mode = "mpt"
+    else:
+        conv_mode = "llava_v0"
+
+    # if args.conv_mode is not None and conv_mode != args.conv_mode:
+    #     print(
+    #         "[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}".format(
+    #             conv_mode, args.conv_mode, args.conv_mode
+    #         )
+    #     )
+    # else:
+    #     args.conv_mode = conv_mode
+
+    conv = conv_templates[conv_mode].copy()
+    conv.append_message(conv.roles[0], qs)
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+
+    # image_files = image_parser(args)
+    # images = load_images(image_files)
+    images_tensor = process_images(
+        images_tensor,
+        image_processor,
+        model.config
+    ).to(model.device, dtype=torch.float16)
+    # images_tensor = images_tensor.to(model.device, dtype=torch.float16)
+
+    input_ids = (
+        tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+        .unsqueeze(0)
+        .cuda()
+    ).to(model.device)
+
+    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+    keywords = [stop_str]
+    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+
+    with torch.inference_mode():
+        output_ids = model.generate(
+            input_ids,
+            images=images_tensor,
+            do_sample=False,
+            use_cache=True,
+            stopping_criteria=[stopping_criteria],
+        )
+
+    input_token_len = input_ids.shape[1]
+    n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
+    if n_diff_input_output > 0:
+        print(
+            f"[Warning] {n_diff_input_output} output_ids are not the same as the input_ids"
+        )
+    outputs = tokenizer.batch_decode(
+        output_ids[:, input_token_len:], skip_special_tokens=True
+    )[0]
+    outputs = outputs.strip()
+    if outputs.endswith(stop_str):
+        outputs = outputs[: -len(stop_str)]
+    outputs = outputs.strip()
+    return outputs
+
+
 
 def eval_model(args):
     # Model
